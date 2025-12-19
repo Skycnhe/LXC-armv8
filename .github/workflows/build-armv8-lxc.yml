@@ -1,0 +1,178 @@
+name: Build OpenWrt 24.10 ARMv8 LXC (Auto Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH 连接到 Actions (调试用)'
+        required: false
+        default: false
+        type: boolean
+      # --- 插件选择开关 (无 Docker) ---
+      ENABLE_PASSWALL:
+        description: '安装 PassWall (科学上网)'
+        required: false
+        default: true
+        type: boolean
+      ENABLE_OPENCLASH:
+        description: '安装 OpenClash (备用科学)'
+        required: false
+        default: false
+        type: boolean
+      ENABLE_THEME_ARGON:
+        description: '安装 Argon 主题 (美化界面)'
+        required: false
+        default: true
+        type: boolean
+      ENABLE_TOOLS:
+        description: '安装常用工具 (ttyd/diskman/wrtbwmon)'
+        required: false
+        default: true
+        type: boolean
+
+# 【重要】赋予 Release 写入权限，否则发布会失败
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: armv8-lxc.config
+  DIY_SH: diy.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: Clone source code
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+
+    - name: Add External Feeds
+      working-directory: ./openwrt
+      run: |
+        # 添加第三方源 (Kenzo/Small)
+        echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
+        echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
+
+    - name: Update & Install feeds
+      working-directory: ./openwrt
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load base configuration
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        if [ -e $DIY_SH ]; then
+          chmod +x $DIY_SH
+          cd openwrt
+          ../$DIY_SH
+        fi
+
+    # --- 动态选择插件逻辑 ---
+    - name: Apply Custom Plugin Selection
+      working-directory: ./openwrt
+      run: |
+        echo "Processing user selections..."
+        
+        # 1. PassWall
+        if [ "${{ inputs.ENABLE_PASSWALL }}" == "true" ]; then
+          echo "Enabling PassWall..."
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ChinaDNS_NG=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y" >> .config
+        fi
+
+        # 2. OpenClash
+        if [ "${{ inputs.ENABLE_OPENCLASH }}" == "true" ]; then
+          echo "Enabling OpenClash..."
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-openclash_INCLUDE_OP_Core=y" >> .config
+        fi
+
+        # 3. Argon Theme
+        if [ "${{ inputs.ENABLE_THEME_ARGON }}" == "true" ]; then
+          echo "Enabling Argon Theme..."
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
+        fi
+        
+        # 4. Tools
+        if [ "${{ inputs.ENABLE_TOOLS }}" == "true" ]; then
+          echo "Enabling Tools..."
+          echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-diskman=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-wrtbwmon=y" >> .config
+        fi
+
+    - name: Download package
+      working-directory: ./openwrt
+      run: |
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      working-directory: ./openwrt
+      run: |
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Organize files
+      id: organize
+      run: |
+        mkdir -p ./artifact/
+        # 查找 rootfs.tar.gz
+        find openwrt/bin/targets/ -name "*rootfs.tar.gz" -exec cp {} ./artifact/ \;
+        ls -lh ./artifact/
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        touch release.txt
+        echo "## OpenWrt 24.10 ARMv8 LXC" >> release.txt
+        echo "Build Date: $(date +"%Y-%m-%d %H:%M")" >> release.txt
+        echo "### Selected Plugins" >> release.txt
+        echo "- PassWall: ${{ inputs.ENABLE_PASSWALL }}" >> release.txt
+        echo "- OpenClash: ${{ inputs.ENABLE_OPENCLASH }}" >> release.txt
+        echo "- Argon: ${{ inputs.ENABLE_THEME_ARGON }}" >> release.txt
+        echo "- Tools: ${{ inputs.ENABLE_TOOLS }}" >> release.txt
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        body_path: release.txt
+        files: ./artifact/*.tar.gz
+
+    - name: Upload firmware to artifact
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_LXC_Build
+        path: ./artifact/

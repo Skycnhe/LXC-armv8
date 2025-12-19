@@ -1,0 +1,220 @@
+name: Build OpenWrt 24.10 ARMv8 LXC (Final)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH 连接到 Actions (调试用)'
+        required: false
+        default: false
+        type: boolean
+
+      # --- 1. 模式选择 (新增) ---
+      ENABLE_SIDE_ROUTER:
+        description: '预置旁路由模式 (关闭DHCP+强制NAT转发)'
+        required: false
+        default: false
+        type: boolean
+
+      # --- 2. 核心插件 ---
+      ENABLE_PASSWALL:
+        description: '安装 PassWall (科学上网)'
+        required: false
+        default: true
+        type: boolean
+      ENABLE_OPENCLASH:
+        description: '安装 OpenClash (备用科学)'
+        required: false
+        default: false
+        type: boolean
+
+      # --- 3. 常用功能 ---
+      ENABLE_THEME_ARGON:
+        description: '安装 Argon 主题 (美化界面)'
+        required: false
+        default: true
+        type: boolean
+      ENABLE_KMS:
+        description: '安装 KMS 服务器'
+        required: false
+        default: true
+        type: boolean
+      ENABLE_DDNS_GO:
+        description: '安装 DDNS-Go'
+        required: false
+        default: false
+        type: boolean
+      ENABLE_ALIST:
+        description: '安装 Alist 网盘'
+        required: false
+        default: false
+        type: boolean
+      ENABLE_TOOLS:
+        description: '安装运维工具 (ttyd/diskman)'
+        required: false
+        default: true
+        type: boolean
+
+      # --- 4. 万能自定义 ---
+      EXTRA_PACKAGES:
+        description: '手动添加软件包 (空格分隔)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: armv8-lxc.config
+  DIY_SH: diy.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: Clone source code
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+
+    - name: Add External Feeds
+      working-directory: ./openwrt
+      run: |
+        echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
+        echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
+
+    - name: Update & Install feeds
+      working-directory: ./openwrt
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load base configuration
+      run: |
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        if [ -e $DIY_SH ]; then
+          chmod +x $DIY_SH
+          cd openwrt
+          ../$DIY_SH
+        fi
+
+    - name: Apply Custom Plugin & Mode Selection
+      working-directory: ./openwrt
+      run: |
+        echo "Processing user selections..."
+        
+        # --- 【关键新增】旁路由模式逻辑 ---
+        if [ "${{ inputs.ENABLE_SIDE_ROUTER }}" == "true" ]; then
+          echo "Setting up Side Router Mode..."
+          
+          # 创建一个 files 目录结构，用于覆盖固件文件
+          mkdir -p files/etc/uci-defaults
+          
+          # 生成首次启动脚本 (99-side-router-setup)
+          # 作用1: 禁用 LAN 口 DHCP (防止抢主路由生意)
+          # 作用2: 添加 iptables MASQUERADE 规则 (修复旁路由无法上网/客户端没网的问题)
+          cat <<EOF > files/etc/uci-defaults/99-side-router-setup
+        #!/bin/sh
+        uci set dhcp.lan.ignore='1'
+        uci commit dhcp
+        
+        # 添加防火墙自定义规则 (适用于 fw4/nftables 环境的兼容写法)
+        echo "iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE" >> /etc/firewall.user
+        
+        exit 0
+        EOF
+        
+          # 确保脚本有执行权限 (通过 uci-defaults 机制运行后会自动删除)
+          chmod +x files/etc/uci-defaults/99-side-router-setup
+        fi
+
+        # --- 插件逻辑 ---
+        if [ "${{ inputs.ENABLE_PASSWALL }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_ChinaDNS_NG=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Haproxy=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata=y" >> .config
+        fi
+
+        if [ "${{ inputs.ENABLE_OPENCLASH }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-openclash=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-openclash_INCLUDE_OP_Core=y" >> .config
+        fi
+
+        if [ "${{ inputs.ENABLE_THEME_ARGON }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
+        fi
+        
+        if [ "${{ inputs.ENABLE_KMS }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-vlmcsd=y" >> .config
+        fi
+
+        if [ "${{ inputs.ENABLE_DDNS_GO }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-ddns-go=y" >> .config
+        fi
+
+        if [ "${{ inputs.ENABLE_ALIST }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-alist=y" >> .config
+        fi
+
+        if [ "${{ inputs.ENABLE_TOOLS }}" == "true" ]; then
+          echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-diskman=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-wrtbwmon=y" >> .config
+        fi
+
+        EXTRA_PKGS="${{ inputs.EXTRA_PACKAGES }}"
+        if [ -n "$EXTRA_PKGS" ]; then
+          for pkg in $EXTRA_PKGS; do
+            echo "CONFIG_PACKAGE_$pkg=y" >> .config
+          done
+        fi
+
+    - name: Download package
+      working-directory: ./openwrt
+      run: |
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      working-directory: ./openwrt
+      run: |
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Organize files
+      id: organize
+      run: |
+        mkdir -p ./artifact/
+        find openwrt/bin/targets/ -name "*rootfs.tar.gz" -exec cp {} ./artifact/ \;
+        ls -lh ./artifact/
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "RELEASE_TAG=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        touch release.txt
+        e
